@@ -13,18 +13,16 @@ import java.util.zip.{ Inflater, CRC32, ZipException, Deflater }
 import akka.http.model._
 import headers.HttpEncodings
 
-class Gzip(val messageFilter: HttpMessage ⇒ Boolean) extends Coder with StreamDecoder {
-  val encoding = HttpEncodings.gzip
-  def newCompressor = new GzipCompressor
-  def newDecompressorStage(maxBytesPerChunk: Int) = () ⇒ new GzipDecompressor(maxBytesPerChunk)
+class Gzip extends Coder with Compression {
+  override val encoding = HttpEncodings.gzip
+  override def newCompressor = new GzipCompressor
+  override def newDecompressor(maxBytesPerChunk: Int) = new GzipDecompressor(maxBytesPerChunk)
 }
 
 /**
  * An encoder and decoder for the HTTP 'gzip' encoding.
  */
-object Gzip extends Gzip(Encoder.DefaultFilter) {
-  def apply(messageFilter: HttpMessage ⇒ Boolean) = new Gzip(messageFilter)
-}
+object Gzip extends Gzip
 
 class GzipCompressor extends DeflateCompressor {
   override protected lazy val deflater = new Deflater(Deflater.BEST_COMPRESSION, true)
@@ -59,7 +57,7 @@ class GzipCompressor extends DeflateCompressor {
   }
 }
 
-class GzipDecompressor(maxBytesPerChunk: Int = Decoder.MaxBytesPerChunkDefault) extends DeflateDecompressorBase(maxBytesPerChunk) {
+class GzipDecompressor(maxBytesPerChunk: Int) extends DeflateDecompressorBase(maxBytesPerChunk) {
   protected def createInflater(): Inflater = new Inflater(true)
 
   def initial: State = Initial

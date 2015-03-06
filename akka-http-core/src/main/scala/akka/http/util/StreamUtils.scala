@@ -145,9 +145,6 @@ private[http] object StreamUtils {
 
     }
 
-  def mapEntityError(f: Throwable ⇒ Throwable): RequestEntity ⇒ RequestEntity =
-    _.transformDataBytes(mapErrorTransformer(f))
-
   /**
    * Simple blocking Source backed by an InputStream.
    *

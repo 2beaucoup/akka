@@ -4,5 +4,9 @@
 
 package akka.http.coding
 
-/** Marker trait for A combined Encoder and Decoder */
-trait Coder extends Encoder with Decoder
+import akka.http.model.headers.HttpEncoding
+
+/** Trait for A combined Encoder and Decoder. */
+trait Coder extends Encoder with Decoder {
+  def hasCompression: Boolean
+}

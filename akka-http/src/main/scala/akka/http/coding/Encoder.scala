@@ -5,73 +5,42 @@
 package akka.http.coding
 
 import akka.http.model._
-import akka.http.util.StreamUtils
-import akka.stream.stage.Stage
+import akka.http.model.headers.{ HttpEncoding, `Content-Encoding`, HttpEncodings }
+import akka.http.util._
+import akka.stream.FlowMaterializer
+import akka.stream.scaladsl.{ Sink, Source, Flow }
 import akka.util.ByteString
-import headers._
-import akka.stream.scaladsl.Flow
+
+import scala.collection.immutable
+import scala.concurrent.duration._
 
 trait Encoder {
-  def encoding: HttpEncoding
+  val encoding: HttpEncoding
 
-  def messageFilter: HttpMessage ⇒ Boolean
+  def encoder: Flow[ByteString, ByteString, Unit]
 
-  def encode[T <: HttpMessage](message: T)(implicit mapper: DataMapper[T]): T#Self =
-    if (messageFilter(message) && !message.headers.exists(Encoder.isContentEncodingHeader))
-      encodeData(message).withHeaders(`Content-Encoding`(encoding) +: message.headers)
-    else message.self
+  protected def addEncoding(headers: immutable.Seq[HttpHeader]) =
+    if (encoding == HttpEncodings.identity) headers
+    else if (headers.exists(_.isInstanceOf[`Content-Encoding`]))
+      headers.map {
+        case `Content-Encoding`(encodings) ⇒ `Content-Encoding`(encodings :+ encoding)
+        case x                             ⇒ x
+      }
+    else `Content-Encoding`(encoding) +: headers
 
-  def encodeData[T](t: T)(implicit mapper: DataMapper[T]): T =
-    mapper.transformDataBytes(t, Flow[ByteString].transform(newEncodeTransformer))
+  def encode[T <: HttpMessage](message: T): T =
+    (message.header[`Content-Encoding`] match {
+      case Some(`Content-Encoding`(encodings)) if encodings.contains(encoding) ⇒
+        message // noop
+      case None ⇒
+        message
+          .mapEntity(_.transformDataBytes(encoder).asInstanceOf[MessageEntity]) // FIXME
+          .mapHeaders(addEncoding)
+    }).asInstanceOf[T]
 
-  def encode(input: ByteString): ByteString = newCompressor.compressAndFinish(input)
+  def encodeBytes(bytes: ByteString, timeout: Duration = 1.second)(implicit materializer: FlowMaterializer): ByteString =
+    Source.single(bytes).via(encoder).runWith(Sink.head()).awaitResult(timeout)
 
-  def newCompressor: Compressor
-
-  def newEncodeTransformer(): Stage[ByteString, ByteString] = {
-    val compressor = newCompressor
-
-    def encodeChunk(bytes: ByteString): ByteString = compressor.compressAndFlush(bytes)
-    def finish(): ByteString = compressor.finish()
-
-    StreamUtils.byteStringTransformer(encodeChunk, finish)
-  }
-}
-
-object Encoder {
-  val DefaultFilter: HttpMessage ⇒ Boolean = {
-    case req: HttpRequest                    ⇒ isCompressible(req)
-    case res @ HttpResponse(status, _, _, _) ⇒ isCompressible(res) && status.isSuccess
-  }
-  private[coding] def isCompressible(msg: HttpMessage): Boolean =
-    msg.entity.contentType.mediaType.compressible
-
-  private[coding] val isContentEncodingHeader: HttpHeader ⇒ Boolean = _.isInstanceOf[`Content-Encoding`]
-}
-
-/** A stateful object representing ongoing compression. */
-abstract class Compressor {
-  /**
-   * Compresses the given input and returns compressed data. The implementation
-   * can and will choose to buffer output data to improve compression. Use
-   * `flush` or `compressAndFlush` to make sure that all input data has been
-   * compressed and pending output data has been returned.
-   */
-  def compress(input: ByteString): ByteString
-
-  /**
-   * Flushes any output data and returns the currently remaining compressed data.
-   */
-  def flush(): ByteString
-
-  /**
-   * Closes this compressed stream and return the remaining compressed data. After
-   * calling this method, this Compressor cannot be used any further.
-   */
-  def finish(): ByteString
-
-  /** Combines `compress` + `flush` */
-  def compressAndFlush(input: ByteString): ByteString
-  /** Combines `compress` + `finish` */
-  def compressAndFinish(input: ByteString): ByteString
+  def encodeString(s: String, charset: String = "UTF8")(implicit materializer: FlowMaterializer): ByteString =
+    encodeBytes(ByteString(s, charset))
 }

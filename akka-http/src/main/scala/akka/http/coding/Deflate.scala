@@ -10,15 +10,18 @@ import akka.util.{ ByteStringBuilder, ByteString }
 
 import scala.annotation.tailrec
 import akka.http.util._
-import akka.http.model._
 import akka.http.model.headers.HttpEncodings
 
-class Deflate(val messageFilter: HttpMessage ⇒ Boolean) extends Coder with StreamDecoder {
-  val encoding = HttpEncodings.deflate
-  def newCompressor = new DeflateCompressor
-  def newDecompressorStage(maxBytesPerChunk: Int) = () ⇒ new DeflateDecompressor(maxBytesPerChunk)
+class Deflate extends Coder with Compression {
+  override val encoding = HttpEncodings.deflate
+  override def newCompressor = new DeflateCompressor
+  override def newDecompressor(maxBytesPerChunk: Int) = new DeflateDecompressor(maxBytesPerChunk)
 }
-object Deflate extends Deflate(Encoder.DefaultFilter)
+
+/**
+ * An encoder and decoder for the HTTP 'deflate' encoding.
+ */
+object Deflate extends Deflate
 
 class DeflateCompressor extends Compressor {
   protected lazy val deflater = new Deflater(Deflater.BEST_COMPRESSION, false)
@@ -82,7 +85,7 @@ class DeflateCompressor extends Compressor {
     new Array[Byte](size)
 }
 
-class DeflateDecompressor(maxBytesPerChunk: Int = Decoder.MaxBytesPerChunkDefault) extends DeflateDecompressorBase(maxBytesPerChunk) {
+class DeflateDecompressor(maxBytesPerChunk: Int) extends DeflateDecompressorBase(maxBytesPerChunk) {
   protected def createInflater() = new Inflater()
 
   def initial: State = StartInflate
@@ -92,7 +95,7 @@ class DeflateDecompressor(maxBytesPerChunk: Int = Decoder.MaxBytesPerChunkDefaul
   protected def onTruncation(ctx: Context[ByteString]): Directive = ctx.finish()
 }
 
-abstract class DeflateDecompressorBase(maxBytesPerChunk: Int = Decoder.MaxBytesPerChunkDefault) extends ByteStringParserStage[ByteString] {
+abstract class DeflateDecompressorBase(maxBytesPerChunk: Int) extends ByteStringParserStage[ByteString] {
   protected def createInflater(): Inflater
   val inflater = createInflater()
 

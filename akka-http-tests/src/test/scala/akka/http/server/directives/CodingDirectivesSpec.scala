@@ -7,7 +7,7 @@ package directives
 
 import org.scalatest.matchers.Matcher
 import akka.util.ByteString
-import akka.stream.scaladsl.Source
+import akka.stream.scaladsl.{ Sink, Source }
 import akka.http.util._
 import akka.http.model._
 import akka.http.coding._
@@ -25,11 +25,11 @@ class CodingDirectivesSpec extends RoutingSpec {
   val echoRequestContent: Route = { ctx ⇒ ctx.complete(ctx.request.entity.dataBytes.utf8String) }
 
   val yeah = complete("Yeah!")
-  lazy val yeahGzipped = compress("Yeah!", Gzip)
-  lazy val yeahDeflated = compress("Yeah!", Deflate)
+  lazy val yeahGzipped = encode("Yeah!", Gzip)
+  lazy val yeahDeflated = encode("Yeah!", Deflate)
 
-  lazy val helloGzipped = compress("Hello", Gzip)
-  lazy val helloDeflated = compress("Hello", Deflate)
+  lazy val helloGzipped = encode("Hello", Gzip)
+  lazy val helloDeflated = encode("Hello", Deflate)
 
   "the NoEncoding decoder" should {
     "decode the request content if it has encoding 'identity'" in {
@@ -165,7 +165,7 @@ class CodingDirectivesSpec extends RoutingSpec {
         response should haveContentEncoding(gzip)
         chunks.size shouldEqual (11 + 1) // 11 regular + the last one
         val bytes = chunks.foldLeft(ByteString.empty)(_ ++ _.data)
-        Gzip.decode(bytes).awaitResult(1.second) should readAs(text)
+        Gzip.decodeBytes(bytes) should readAs(text)
       }
     }
   }
@@ -395,10 +395,11 @@ class CodingDirectivesSpec extends RoutingSpec {
     }
   }
 
-  def compress(input: String, encoder: Encoder): ByteString = {
-    val compressor = encoder.newCompressor
-    compressor.compressAndFlush(ByteString(input)) ++ compressor.finish()
-  }
+  def encode(bytes: ByteString, encoder: Encoder, timeout: Duration = 1.second): ByteString =
+    Source.single(bytes).via(encoder.encoder).runWith(Sink.head()).awaitResult(timeout)
+
+  def encode(s: String, encoder: Encoder): ByteString =
+    encode(ByteString(s), encoder)
 
   def hexDump(bytes: Array[Byte]) = bytes.map("%02x" format _).mkString
   def fromHexDump(dump: String) = dump.grouped(2).toArray.map(chars ⇒ Integer.parseInt(new String(chars), 16).toByte)

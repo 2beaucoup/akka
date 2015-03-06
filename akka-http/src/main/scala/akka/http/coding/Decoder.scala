@@ -5,50 +5,47 @@
 package akka.http.coding
 
 import akka.http.model._
+import akka.http.model.headers.{ HttpEncoding, `Content-Encoding` }
+import akka.http.util._
 import akka.stream.FlowMaterializer
-import akka.stream.stage.Stage
-import akka.util.ByteString
-import headers.HttpEncoding
 import akka.stream.scaladsl.{ Sink, Source, Flow }
+import akka.util.ByteString
 
-import scala.concurrent.Future
+import scala.collection.immutable
+import scala.concurrent.duration._
+import scala.util.control.NonFatal
 
 trait Decoder {
-  def encoding: HttpEncoding
+  val encoding: HttpEncoding
 
-  def decode[T <: HttpMessage](message: T)(implicit mapper: DataMapper[T]): T#Self =
-    if (message.headers exists Encoder.isContentEncodingHeader)
-      decodeData(message).withHeaders(message.headers filterNot Encoder.isContentEncodingHeader)
-    else message.self
+  def decoder(maxBytesPerChunk: Int): Flow[ByteString, ByteString, Unit]
 
-  def decodeData[T](t: T)(implicit mapper: DataMapper[T]): T = mapper.transformDataBytes(t, decoderFlow)
+  protected def removeEncoding(headers: immutable.Seq[HttpHeader]) = headers flatMap {
+    case `Content-Encoding`(Seq(`encoding`)) ⇒ None
+    case `Content-Encoding`(encodings :+ `encoding`) ⇒ Some(`Content-Encoding`(encodings))
+    case x ⇒ Some(x)
+  }
 
-  def maxBytesPerChunk: Int
-  def withMaxBytesPerChunk(maxBytesPerChunk: Int): Decoder
-
-  def decoderFlow: Flow[ByteString, ByteString, Unit]
-  def decode(input: ByteString)(implicit mat: FlowMaterializer): Future[ByteString] =
-    Source.single(input).via(decoderFlow).runWith(Sink.head)
-}
-object Decoder {
-  val MaxBytesPerChunkDefault: Int = 65536
-}
-
-/** A decoder that is implemented in terms of a [[Stage]] */
-trait StreamDecoder extends Decoder { outer ⇒
-  protected def newDecompressorStage(maxBytesPerChunk: Int): () ⇒ Stage[ByteString, ByteString]
-
-  def maxBytesPerChunk: Int = Decoder.MaxBytesPerChunkDefault
-  def withMaxBytesPerChunk(newMaxBytesPerChunk: Int): Decoder =
-    new StreamDecoder {
-      def encoding: HttpEncoding = outer.encoding
-      override def maxBytesPerChunk: Int = newMaxBytesPerChunk
-
-      def newDecompressorStage(maxBytesPerChunk: Int): () ⇒ Stage[ByteString, ByteString] =
-        outer.newDecompressorStage(maxBytesPerChunk)
+  def decode[T <: HttpMessage](message: T, maxBytesPerChunk: Int): T = {
+    val transform = decoder(maxBytesPerChunk) via StreamUtils.mapErrorTransformer {
+      case NonFatal(e) ⇒
+        IllegalRequestException(
+          StatusCodes.BadRequest,
+          ErrorInfo("The request's encoding is corrupt", e.getMessage))
     }
+    (message.header[`Content-Encoding`] match {
+      case Some(`Content-Encoding`(_ :+ `encoding`)) ⇒
+        message
+          .mapEntity(_.transformDataBytes(transform).asInstanceOf[MessageEntity]) // FIXME
+          .mapHeaders(removeEncoding)
+      case _ ⇒
+        message // noop
+    }).asInstanceOf[T]
+  }
 
-  def decoderFlow: Flow[ByteString, ByteString, Unit] =
-    Flow[ByteString].transform(newDecompressorStage(maxBytesPerChunk))
+  def decodeBytes(bytes: ByteString, timeout: Duration = 1.second)(implicit materializer: FlowMaterializer): ByteString =
+    Source.single(bytes).via(decoder(bytes.length)).runWith(Sink.head()).awaitResult(timeout)
 
+  def decodeString(bytes: ByteString, charset: String = "UTF8")(implicit materializer: FlowMaterializer): String =
+    decodeBytes(bytes).decodeString(charset)
 }

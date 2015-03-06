@@ -4,15 +4,24 @@
 
 package akka.http.coding
 
-import org.scalatest.{ Suite, BeforeAndAfterAll, Matchers }
+import akka.actor.ActorSystem
+import akka.stream.ActorFlowMaterializer
+import akka.stream.scaladsl.Flow
+import akka.stream.stage.{ Context, Directive, PushStage }
+import akka.util.ByteString
+import org.scalatest.{ BeforeAndAfterAll, Matchers, Suite }
 
 import scala.concurrent.duration._
 
-import akka.actor.ActorSystem
-import akka.stream.ActorFlowMaterializer
-import akka.util.ByteString
-
 trait CodecSpecSupport extends Matchers with BeforeAndAfterAll { self: Suite ⇒
+
+  val maxBytesPerChunk = 65536
+
+  def appendingFlow(suffix: String) = Flow[ByteString].transform(
+    () ⇒ new PushStage[ByteString, ByteString] {
+      def onPush(elem: ByteString, ctx: Context[ByteString]): Directive =
+        ctx.push(elem ++ ByteString(suffix))
+    })
 
   def readAs(string: String, charset: String = "UTF8") = equal(string).matcher[String] compose { (_: ByteString).decodeString(charset) }
   def hexDump(bytes: ByteString) = bytes.map("%02x".format(_)).mkString

@@ -7,10 +7,8 @@ package akka.http.coding
 import java.io.{ OutputStream, InputStream }
 
 class NoCodingSpec extends CoderSpec {
-  protected def Coder: Coder with StreamDecoder = NoCoding
-
+  override protected def Coder = NoCoding
   override protected def corruptInputCheck = false
-
-  protected def newEncodedOutputStream(underlying: OutputStream): OutputStream = underlying
-  protected def newDecodedInputStream(underlying: InputStream): InputStream = underlying
+  override protected def newEncodedOutputStream(underlying: OutputStream) = underlying
+  override protected def newDecodedInputStream(underlying: InputStream) = underlying
 }

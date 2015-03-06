@@ -5,17 +5,13 @@
 package akka.http.server
 package directives
 
-import akka.http.util._
-import akka.http.model._
-import akka.http.model.headers.{ HttpEncodings, `Accept-Encoding`, HttpEncoding, HttpEncodingRange }
+import akka.http.model.headers._
 import akka.http.coding._
-import scala.annotation.tailrec
 import scala.collection.immutable
-import scala.util.control.NonFatal
 
 trait CodingDirectives {
+
   import BasicDirectives._
-  import MiscDirectives._
   import RouteDirectives._
   import CodingDirectives._
   import HeaderDirectives._
@@ -38,7 +34,7 @@ trait CodingDirectives {
    * If the `Accept-Encoding` header is missing or empty or specifies an encoding other than
    * identity, gzip or deflate then no encoding is used.
    */
-  def encodeResponse = encodeResponseWith(NoCoding, Gzip, Deflate)
+  def encodeResponse = encode(DefaultCoders)
 
   /**
    * Encodes the response with the encoding that is requested by the client with the `Accept-
@@ -51,14 +47,14 @@ trait CodingDirectives {
    * If the `Accept-Encoding` header is empty and `NoCoding` is part of the encoders then no
    * response encoding is used. Otherwise the request is rejected.
    */
-  def encodeResponseWith(first: Encoder, more: Encoder*) = _encodeResponse(immutable.Seq(first +: more: _*))
+  def encodeResponseWith(first: Coder, more: Coder*) = encode(immutable.Seq(first +: more: _*))
 
-  private def _encodeResponse(encoders: immutable.Seq[Encoder]): Directive0 =
+  private def encode(coders: immutable.Seq[Coder]): Directive0 =
     optionalHeaderValueByType[`Accept-Encoding`]().flatMap { accept ⇒
-      val acceptedEncoder = accept match {
+      val acceptedCoders = accept match {
         case None ⇒
           // use first defined encoder when Accept-Encoding is missing
-          encoders.headOption
+          coders.headOption.toList
         case Some(`Accept-Encoding`(encodings)) ⇒
           // provide fallback to identity
           val withIdentity =
@@ -67,43 +63,23 @@ trait CodingDirectives {
               case _ ⇒ false
             }) encodings
             else encodings :+ HttpEncodings.`identity;q=MIN`
-          // sort client-accepted encodings by q-Value (and orig. order) and find first matching encoder
-          @tailrec def find(encodings: List[HttpEncodingRange]): Option[Encoder] = encodings match {
-            case encoding :: rest ⇒
-              encoders.find(e ⇒ encoding.matches(e.encoding)) match {
-                case None ⇒ find(rest)
-                case x    ⇒ x
-              }
-            case _ ⇒ None
+          // sort client-accepted encodings by q-Value (and orig. order) and filter by matching codecs
+          val sorted = withIdentity.sortBy(e ⇒ (-e.qValue, withIdentity.indexOf(e))).toList
+          sorted.flatMap { case encoding ⇒ coders.find(codec ⇒ encoding.matches(codec.encoding)) }
+      }
+      if (acceptedCoders.nonEmpty)
+        mapResponse { response ⇒
+          val compressible =
+            response.status.isSuccess && response.entity.contentType.mediaType.compressible
+          acceptedCoders.find(c ⇒ !c.hasCompression || compressible) match {
+            case Some(coder) ⇒ coder.encode(response)
+            case None        ⇒ response // FIXME: FAIL
           }
-          find(withIdentity.sortBy(e ⇒ (-e.qValue, withIdentity.indexOf(e))).toList)
-      }
-      acceptedEncoder match {
-        case Some(encoder) ⇒ mapResponse(encoder.encode(_))
-        case _             ⇒ reject(UnacceptedResponseEncodingRejection(encoders.map(_.encoding).toSet))
-      }
+        }
+      else reject(UnacceptedResponseEncodingRejection(coders.map(_.encoding).toSet))
     }
 
   // decoding
-
-  /**
-   * Wraps its inner Route with decoding support using the given Decoder.
-   */
-  def decodeRequestWith(decoder: Decoder): Directive0 = {
-    def applyDecoder =
-      extractSettings.flatMap(settings ⇒
-        mapRequest(decoder.withMaxBytesPerChunk(settings.decodeMaxBytesPerChunk).decode(_).mapEntity(StreamUtils.mapEntityError {
-          case NonFatal(e) ⇒
-            IllegalRequestException(
-              StatusCodes.BadRequest,
-              ErrorInfo("The request's encoding is corrupt", e.getMessage))
-        })))
-
-    requestEntityEmpty | (
-      requestEncodedWith(decoder.encoding) &
-      applyDecoder &
-      cancelRejections(classOf[UnsupportedRequestEncodingRejection]))
-  }
 
   /**
    * Rejects the request with an UnsupportedRequestEncodingRejection if its encoding doesn't match the given one.
@@ -115,20 +91,29 @@ trait CodingDirectives {
     }
 
   /**
+   * Wraps its inner Route with decoding support using the given Decoder.
+   */
+  def decodeRequestWith(first: Coder, more: Coder*): Directive0 = decode(immutable.Seq(first +: more: _*))
+
+  /**
    * Decompresses the incoming request if it is encoded with one of the given
    * encoders. If the request encoding doesn't match one of the given encoders
    * the request is rejected with an `UnsupportedRequestEncodingRejection`.
    */
-  def decodeRequestWith(decoders: Decoder*): Directive0 =
-    theseOrDefault(decoders).map(decodeRequestWith).reduce(_ | _)
+  def decodeRequest: Directive0 = decode(DefaultCoders)
 
-  def decodeRequest: Directive0 =
-    decodeRequestWith(DefaultCoders: _*)
+  private def decode(coders: immutable.Seq[Coder]): Directive0 =
+    extract(ctx ⇒ (ctx.request.encoding, ctx.settings)) flatMap {
+      case (encoding, settings) ⇒
+        coders.find(_.encoding == encoding) match {
+          case Some(coder) ⇒
+            mapRequest(coder.decode(_, settings.decodeMaxBytesPerChunk))
+          case None ⇒
+            reject(UnsupportedRequestEncodingRejection(encoding))
+        }
+    }
 }
 
 object CodingDirectives extends CodingDirectives {
-  val DefaultCoders: immutable.Seq[Coder] = immutable.Seq(Gzip, Deflate, NoCoding)
-  def theseOrDefault[T >: Coder](these: Seq[T]): Seq[T] =
-    if (these.isEmpty) DefaultCoders
-    else these
+  val DefaultCoders: immutable.Seq[Coder] = immutable.Seq(NoCoding, Gzip, Deflate)
 }
