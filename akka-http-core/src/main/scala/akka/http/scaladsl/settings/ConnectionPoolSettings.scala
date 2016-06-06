@@ -14,6 +14,7 @@ import scala.concurrent.duration.Duration
  */
 abstract class ConnectionPoolSettings extends js.ConnectionPoolSettings { self: ConnectionPoolSettingsImpl ⇒
   def maxConnections: Int
+  def minConnections: Int
   def maxRetries: Int
   def maxOpenRequests: Int
   def pipeliningLimit: Int
@@ -26,6 +27,7 @@ abstract class ConnectionPoolSettings extends js.ConnectionPoolSettings { self: 
   final override def getPipeliningLimit: Int = pipeliningLimit
   final override def getIdleTimeout: Duration = idleTimeout
   final override def getMaxConnections: Int = maxConnections
+  final override def getMinConnections: Int = maxConnections
   final override def getMaxOpenRequests: Int = maxOpenRequests
   final override def getMaxRetries: Int = maxRetries
 
@@ -33,6 +35,7 @@ abstract class ConnectionPoolSettings extends js.ConnectionPoolSettings { self: 
 
   // overrides for more precise return type
   override def withMaxConnections(n: Int): ConnectionPoolSettings = self.copy(maxConnections = n)
+  override def withMinConnections(n: Int): ConnectionPoolSettings = self.copy(maxConnections = n)
   override def withMaxRetries(n: Int): ConnectionPoolSettings = self.copy(maxRetries = n)
   override def withMaxOpenRequests(newValue: Int): ConnectionPoolSettings = self.copy(maxOpenRequests = newValue)
   override def withPipeliningLimit(newValue: Int): ConnectionPoolSettings = self.copy(pipeliningLimit = newValue)

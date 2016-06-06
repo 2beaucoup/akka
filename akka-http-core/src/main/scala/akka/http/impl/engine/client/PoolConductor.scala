@@ -23,7 +23,7 @@ private object PoolConductor {
   case class Ports(
     requestIn:   Inlet[RequestContext],
     slotEventIn: Inlet[RawSlotEvent],
-    slotOuts:    immutable.Seq[Outlet[RequestContext]]) extends Shape {
+    slotOuts:    immutable.Seq[Outlet[SlotCommand]]) extends Shape {
 
     override val inlets = requestIn :: slotEventIn :: Nil
     override def outlets = slotOuts
@@ -38,18 +38,18 @@ private object PoolConductor {
       Ports(
         inlets.head.asInstanceOf[Inlet[RequestContext]],
         inlets.last.asInstanceOf[Inlet[RawSlotEvent]],
-        outlets.asInstanceOf[immutable.Seq[Outlet[RequestContext]]])
+        outlets.asInstanceOf[immutable.Seq[Outlet[SlotCommand]]])
   }
 
   /*
     Stream Setup
     ============
-                                                                                                  Request-
-    Request-   +-----------+     +-----------+    Switch-    +-------------+     +-----------+    Context
-    Context    |   retry   |     |   slot-   |    Command    |   doubler   |     |   route   +-------------->
-    +--------->|   Merge   +---->| Selector  +-------------->| (MapConcat) +---->|  (Flexi   +-------------->
-               |           |     |           |               |             |     |   Route)  +-------------->
-               +----+------+     +-----+-----+               +-------------+     +-----------+       to slots
+                                                                              Slot-
+    Request-   +-----------+     +-----------+    Switch-    +-----------+   Command
+    Context    |   retry   |     |   slot-   |    Command    |   route   +-------------->
+    +--------->|   Merge   +---->| Selector  +-------------->|  (Flexi   +-------------->
+               |           |     |           |               |   Route)  +-------------->
+               +----+------+     +-----+-----+               +-----------+       to slots
                     ^                  ^
                     |                  | SlotEvent
                     |             +----+----+
@@ -63,12 +63,12 @@ private object PoolConductor {
                                   +---------+
 
   */
-  def apply(slotCount: Int, pipeliningLimit: Int, log: LoggingAdapter): Graph[Ports, Any] =
+  def apply(slotCount: Int, minConnected: Int, pipeliningLimit: Int, log: LoggingAdapter): Graph[Ports, Any] =
     GraphDSL.create() { implicit b ⇒
       import GraphDSL.Implicits._
 
       val retryMerge = b.add(MergePreferred[RequestContext](1, eagerComplete = true))
-      val slotSelector = b.add(new SlotSelector(slotCount, pipeliningLimit, log))
+      val slotSelector = b.add(new SlotSelector(slotCount, minConnected, pipeliningLimit, log))
       val route = b.add(new Route(slotCount))
       val retrySplit = b.add(Broadcast[RawSlotEvent](2))
       val flatten = Flow[RawSlotEvent].mapAsyncUnordered(slotCount) {
@@ -85,7 +85,10 @@ private object PoolConductor {
       Ports(retryMerge.in(0), retrySplit.in, route.outArray.toList)
     }
 
-  private case class SwitchCommand(rc: RequestContext, slotIx: Int)
+  private sealed trait SlotCommand
+  private case class Dispatch(rc: RequestContext) extends SlotCommand
+  private object Connect extends SlotCommand
+  private case class SwitchCommand(slotIx: Int, cmd: SlotCommand)
 
   // the SlotSelector keeps the state of all slots as instances of this ADT
   private sealed trait SlotState
@@ -105,7 +108,7 @@ private object PoolConductor {
   private case class Busy(openRequests: Int) extends SlotState { require(openRequests > 0) }
   private object Busy extends Busy(1)
 
-  private class SlotSelector(slotCount: Int, pipeliningLimit: Int, log: LoggingAdapter)
+  private class SlotSelector(slotCount: Int, minConnected: Int, pipeliningLimit: Int, log: LoggingAdapter)
     extends GraphStage[FanInShape2[RequestContext, SlotEvent, SwitchCommand]] {
 
     private val ctxIn = Inlet[RequestContext]("requestContext")
@@ -126,7 +129,7 @@ private object PoolConductor {
           val slot = nextSlot
           slotStates(slot) = slotStateAfterDispatch(slotStates(slot), ctx.request.method)
           nextSlot = bestSlot()
-          emit(out, SwitchCommand(ctx, slot), tryPullCtx)
+          emit(out, SwitchCommand(slot, Dispatch(ctx)), tryPullCtx)
         }
       })
 
@@ -137,6 +140,8 @@ private object PoolConductor {
               slotStates(slotIx) = slotStateAfterRequestCompleted(slotStates(slotIx))
             case SlotEvent.Disconnected(slotIx, failed) ⇒
               slotStates(slotIx) = slotStateAfterDisconnect(slotStates(slotIx), failed)
+              if (minConnected > 0 && slotStates.count(_ != Unconnected) < minConnected)
+                connect(slotStates.indexWhere(_ == Unconnected))
           }
           pull(slotIn)
           val wasBlocked = nextSlot == -1
@@ -153,6 +158,12 @@ private object PoolConductor {
       override def preStart(): Unit = {
         pull(ctxIn)
         pull(slotIn)
+        for (slot ← 0 until minConnected) connect(slot)
+      }
+
+      def connect(slot: Int): Unit = {
+        slotStates(slot) = Idle
+        emit(out, SwitchCommand(slot, Connect))
       }
 
       def slotStateAfterDispatch(slotState: SlotState, method: HttpMethod): SlotState =
@@ -205,11 +216,11 @@ private object PoolConductor {
     }
   }
 
-  private class Route(slotCount: Int) extends GraphStage[UniformFanOutShape[SwitchCommand, RequestContext]] {
+  private class Route(slotCount: Int) extends GraphStage[UniformFanOutShape[SwitchCommand, SlotCommand]] {
 
     override def initialAttributes = Attributes.name("PoolConductor.Route")
 
-    override val shape = new UniformFanOutShape[SwitchCommand, RequestContext](slotCount)
+    override val shape = new UniformFanOutShape[SwitchCommand, SlotCommand](slotCount)
 
     override def createLogic(effectiveAttributes: Attributes) = new GraphStageLogic(shape) {
       shape.outArray foreach { setHandler(_, ignoreTerminateOutput) }
@@ -218,7 +229,7 @@ private object PoolConductor {
       setHandler(in, new InHandler {
         override def onPush(): Unit = {
           val cmd = grab(in)
-          emit(shape.outArray(cmd.slotIx), cmd.rc, pullIn)
+          emit(shape.outArray(cmd.slotIx), cmd.cmd, pullIn)
         }
       })
       val pullIn = () ⇒ pull(in)

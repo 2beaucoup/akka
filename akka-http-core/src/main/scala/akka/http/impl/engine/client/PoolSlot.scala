@@ -5,7 +5,7 @@
 package akka.http.impl.engine.client
 
 import akka.actor._
-import akka.http.scaladsl.settings.ConnectionPoolSettings
+import akka.http.impl.engine.client.PoolConductor.SlotCommand
 import akka.http.scaladsl.model.{ HttpEntity, HttpRequest, HttpResponse }
 import akka.stream._
 import akka.stream.actor._
@@ -28,6 +28,7 @@ private object PoolSlot {
     final case class RequestCompletedFuture(future: Future[RequestCompleted]) extends RawSlotEvent
     final case class RetryRequest(rc: RequestContext) extends RawSlotEvent
     final case class RequestCompleted(slotIx: Int) extends SlotEvent
+    final case class Connected(slotIx: Int) extends SlotEvent
     final case class Disconnected(slotIx: Int, failedRequests: Int) extends SlotEvent
   }
 
@@ -37,20 +38,17 @@ private object PoolSlot {
     Stream Setup
     ============
 
-    Request-   +-----------+              +-------------+              +-------------+     +------------+
-    Context    | Slot-     |  List[       |   flatten   |  Processor-  |   doubler   |     | SlotEvent- |  Response-
-    +--------->| Processor +------------->| (MapConcat) +------------->| (MapConcat) +---->| Split      +------------->
-               |           |  Processor-  |             |  Out         |             |     |            |  Context
-               +-----------+  Out]        +-------------+              +-------------+     +-----+------+
-                                                                                                 | RawSlotEvent
-                                                                                                 | (to Conductor
-                                                                                                 |  via slotEventMerge)
-                                                                                                 v
+    Request-   +-----------+              +-------------+              +------------+
+    Context    | Slot-     |  List[       |   flatten   |  Processor-  | SlotEvent- |  Response-
+    +--------->| Processor +------------->| (MapConcat) +------------->| Split      +------------->
+               |           |  Processor-  |             |  Out         |            |  Context
+               +-----------+  Out]        +-------------+              +-----+------+
+                                                                             | RawSlotEvent
+                                                                             | (to Conductor
+                                                                             |  via slotEventMerge)
+                                                                             v
    */
-  def apply(slotIx: Int, connectionFlow: Flow[HttpRequest, HttpResponse, Any],
-            settings: ConnectionPoolSettings)(implicit
-    system: ActorSystem,
-                                              fm: Materializer): Graph[FanOutShape2[RequestContext, ResponseContext, RawSlotEvent], Any] =
+  def apply(slotIx: Int, connectionFlow: Flow[HttpRequest, HttpResponse, Any])(implicit system: ActorSystem, fm: Materializer): Graph[FanOutShape2[SlotCommand, ResponseContext, RawSlotEvent], Any] =
     GraphDSL.create() { implicit b ⇒
       import GraphDSL.Implicits._
 
@@ -59,9 +57,9 @@ private object PoolSlot {
       val slotProcessor = b.add {
         Flow.fromProcessor { () ⇒
           val actor = system.actorOf(
-            Props(new SlotProcessor(slotIx, connectionFlow, settings)).withDeploy(Deploy.local),
+            Props(new SlotProcessor(slotIx, connectionFlow)).withDeploy(Deploy.local),
             name)
-          ActorProcessor[RequestContext, List[ProcessorOut]](actor)
+          ActorProcessor[SlotCommand, List[ProcessorOut]](actor)
         }.mapConcat(ConstantFun.scalaIdentityFunction)
       }
       val split = b.add(Broadcast[ProcessorOut](2))
@@ -79,16 +77,18 @@ private object PoolSlot {
 
   /**
    * An actor mananging a series of materializations of the given `connectionFlow`.
-   * To the outside it provides a stable flow stage, consuming `RequestContext` instances on its
+   * To the outside it provides a stable flow stage, consuming `SlotCommand` instances on its
    * input (ActorSubscriber) side and producing `List[ProcessorOut]` instances on its output
    * (ActorPublisher) side.
    * The given `connectionFlow` is materialized into a running flow whenever required.
    * Completion and errors from the connection are not surfaced to the outside (unless we are
    * shutting down completely).
    */
-  private class SlotProcessor(slotIx: Int, connectionFlow: Flow[HttpRequest, HttpResponse, Any],
-                              settings: ConnectionPoolSettings)(implicit fm: Materializer)
+  private class SlotProcessor(slotIx: Int, connectionFlow: Flow[HttpRequest, HttpResponse, Any])(implicit fm: Materializer)
     extends ActorSubscriber with ActorPublisher[List[ProcessorOut]] with ActorLogging {
+
+    import PoolConductor.{ Dispatch, Connect }
+
     var exposedPublisher: akka.stream.impl.ActorPublisher[Any] = _
     var inflightRequests = immutable.Queue.empty[RequestContext]
     val runnableGraph = Source.actorPublisher[HttpRequest](Props(new FlowInportActor(self)).withDeploy(Deploy.local))
@@ -97,9 +97,9 @@ private object PoolSlot {
       .named("SlotProcessorInternalConnectionFlow")
 
     override def requestStrategy = ZeroRequestStrategy
-    override def receive = waitingExposedPublisher
+    override def receive = waitingForExposedPublisher
 
-    def waitingExposedPublisher: Receive = {
+    def waitingForExposedPublisher: Receive = {
       case ExposedPublisher(publisher) ⇒
         exposedPublisher = publisher
         context.become(waitingForSubscribePending)
@@ -114,10 +114,16 @@ private object PoolSlot {
     }
 
     val unconnected: Receive = {
-      case OnNext(rc: RequestContext) ⇒
+      case OnNext(Dispatch(requestContext)) ⇒
         val (connInport, connOutport) = runnableGraph.run()
+        onNext(SlotEvent.Connected(slotIx) :: Nil)
         connOutport ! Request(totalDemand)
-        context.become(waitingForDemandFromConnection(connInport, connOutport, rc))
+        context.become(waitingForDemandFromConnection(connInport, connOutport, requestContext))
+
+      case OnNext(Connect) ⇒
+        val (connInport, connOutport) = runnableGraph.run()
+        onNext(SlotEvent.Connected(slotIx) :: Nil)
+        context.become(running(connInport, connOutport))
 
       case Request(_) ⇒ if (remainingRequested == 0) request(1) // ask for first request if necessary
 
