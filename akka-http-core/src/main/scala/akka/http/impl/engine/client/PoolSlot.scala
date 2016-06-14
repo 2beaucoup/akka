@@ -5,8 +5,9 @@
 package akka.http.impl.engine.client
 
 import akka.actor._
+import akka.http.scaladsl.model.headers.Connection
 import akka.http.scaladsl.settings.ConnectionPoolSettings
-import akka.http.scaladsl.model.{ HttpEntity, HttpRequest, HttpResponse }
+import akka.http.scaladsl.model.{ HttpEntity, HttpMessage, HttpRequest, HttpResponse }
 import akka.stream._
 import akka.stream.actor._
 import akka.stream.impl.{ ActorProcessor, ConstantFun, ExposedPublisher, SeqActorName, SubscribePending }
@@ -97,9 +98,9 @@ private object PoolSlot {
       .named("SlotProcessorInternalConnectionFlow")
 
     override def requestStrategy = ZeroRequestStrategy
-    override def receive = waitingExposedPublisher
+    override def receive = waitingForExposedPublisher
 
-    def waitingExposedPublisher: Receive = {
+    def waitingForExposedPublisher: Receive = {
       case ExposedPublisher(publisher) ⇒
         exposedPublisher = publisher
         context.become(waitingForSubscribePending)
@@ -115,6 +116,7 @@ private object PoolSlot {
 
     val unconnected: Receive = {
       case OnNext(rc: RequestContext) ⇒
+        log.debug("connecting...")
         val (connInport, connOutport) = runnableGraph.run()
         connOutport ! Request(totalDemand)
         context.become(waitingForDemandFromConnection(connInport, connOutport, rc))
@@ -152,6 +154,7 @@ private object PoolSlot {
       case ev @ (Request(_) | Cancel)     ⇒ connOutport ! ev
       case ev @ (OnComplete | OnError(_)) ⇒ connInport ! ev
       case OnNext(rc: RequestContext) ⇒
+        println("toCon()" + rc.request)
         inflightRequests = inflightRequests.enqueue(rc)
         connInport ! OnNext(rc.request)
 
@@ -159,6 +162,7 @@ private object PoolSlot {
       case FromConnection(Cancel)     ⇒ if (!isActive) { cancel(); shutdown() } // else ignore and wait for accompanying OnComplete or OnError
 
       case FromConnection(OnNext(response: HttpResponse)) ⇒
+        println("FromConnection()" + response)
         val requestContext = inflightRequests.head
         inflightRequests = inflightRequests.tail
         val (entity, whenCompleted) = HttpEntity.captureTermination(response.entity)
@@ -166,15 +170,25 @@ private object PoolSlot {
         import fm.executionContext
         val requestCompleted = SlotEvent.RequestCompletedFuture(whenCompleted.map(_ ⇒ SlotEvent.RequestCompleted(slotIx)))
         onNext(delivery :: requestCompleted :: Nil)
+        if (HttpMessage.connectionCloseExpected(response.protocol, response.header[Connection]))
+          context become waitingForCompletion()
 
       case FromConnection(OnComplete) ⇒ handleDisconnect(sender(), None)
       case FromConnection(OnError(e)) ⇒ handleDisconnect(sender(), Some(e))
     }
 
-    def handleDisconnect(connInport: ActorRef, error: Option[Throwable], firstContext: Option[RequestContext] = None): Unit = {
+    def waitingForCompletion(retries: List[RequestContext] = Nil): Receive = {
+      case OnNext(rc: RequestContext) ⇒ context become waitingForCompletion(retries :+ rc)
+      case FromConnection(OnComplete) ⇒ handleDisconnect(sender(), None, retries = retries)
+      case FromConnection(OnError(e)) ⇒ handleDisconnect(sender(), Some(e), retries = retries)
+      case FromConnection(Cancel)     ⇒ if (!isActive) { cancel(); shutdown() }
+      case x                          ⇒ println("!!!!!" + x)
+    }
+
+    def handleDisconnect(connInport: ActorRef, error: Option[Throwable], firstContext: Option[RequestContext] = None, retries: List[RequestContext] = Nil): Unit = {
       log.debug("Slot {} disconnected after {}", slotIx, error getOrElse "regular connection close")
 
-      val results: List[ProcessorOut] = {
+      val results: Seq[ProcessorOut] = {
         if (inflightRequests.isEmpty && firstContext.isDefined) {
           (error match {
             case Some(err) ⇒ ResponseDelivery(ResponseContext(firstContext.get, Failure(new UnexpectedDisconnectException("Unexpected (early) disconnect", err))))
@@ -183,15 +197,17 @@ private object PoolSlot {
         } else {
           inflightRequests.map { rc ⇒
             if (rc.retriesLeft == 0) {
+              println("handleDisconnect()" + inflightRequests.map(_.request).mkString("|"))
               val reason = error.fold[Throwable](new UnexpectedDisconnectException("Unexpected disconnect"))(ConstantFun.scalaIdentityFunction)
               connInport ! ActorPublisherMessage.Cancel
               ResponseDelivery(ResponseContext(rc, Failure(reason)))
             } else SlotEvent.RetryRequest(rc.copy(retriesLeft = rc.retriesLeft - 1))
           }(collection.breakOut)
         }
-      }
+      } ++ retries.map(rc ⇒ SlotEvent.RetryRequest(rc))
       inflightRequests = immutable.Queue.empty
-      onNext(SlotEvent.Disconnected(slotIx, results.size) :: results)
+      println(slotIx + ": " + results)
+      onNext(SlotEvent.Disconnected(slotIx, results.size) :: results.toList)
       if (canceled) onComplete()
 
       context.become(unconnected)

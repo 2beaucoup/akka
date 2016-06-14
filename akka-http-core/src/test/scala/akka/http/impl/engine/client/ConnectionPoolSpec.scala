@@ -23,15 +23,12 @@ import akka.stream.testkit.{ TestPublisher, TestSubscriber }
 import akka.testkit.AkkaSpec
 import akka.util.ByteString
 
-import scala.concurrent.Await
+import scala.concurrent.{ Await, Future }
 import scala.concurrent.duration._
 import scala.util.control.NonFatal
 import scala.util.{ Failure, Success, Try }
 
 class ConnectionPoolSpec extends AkkaSpec("""
-    akka.loggers = []
-    akka.loglevel = OFF
-    akka.io.tcp.windows-connection-abort-workaround-enabled = auto
     akka.io.tcp.trace-logging = off""") {
   implicit val materializer = ActorMaterializer()
 
@@ -227,6 +224,32 @@ class ConnectionPoolSpec extends AkkaSpec("""
       responseOutSub.request(1)
       acceptIncomingConnection()
       val (Success(_), 42) = responseOut.expectNext()
+    }
+  }
+
+  "XXX" should {
+    class LocalTestSetup extends TestSetup(autoAccept = true)
+    import system.dispatcher
+
+    "YYY" in new LocalTestSetup {
+
+      override def testServerHandler(connNr: Int): HttpRequest ⇒ HttpResponse = {
+        case r: HttpRequest ⇒
+          val entity = r.entity
+          val i = Await.result(entity.toStrict(100.millis), 100.millis).data.utf8String.toInt
+          val headers = if ( /*false &&*/ i % 10 == 0) responseHeaders(r, connNr) :+ Connection("close") else responseHeaders(r, connNr)
+          HttpResponse(headers = headers, entity = entity)
+      }
+
+      for (i ← 1 to 100000) {
+        val headers = /*if (i % 100 == 50) Connection("close") :: Nil else */ Nil
+        val responseFuture: Future[HttpResponse] =
+          Http().singleRequest(HttpRequest(method = HttpMethods.POST, headers = headers, uri = s"http://$serverHostName:$serverPort/", entity = HttpEntity(i.toString)))
+        Await.result(responseFuture, 10000.millis).entity.toStrict(100.millis).map(_ shouldEqual (i.toString))
+        //responseFuture.onComplete {
+        //  case Success(response) ⇒ response.entity.toStrict(100.millis).map(_ shouldEqual (i.toString))
+        //}
+      }
     }
   }
 

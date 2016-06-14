@@ -33,7 +33,7 @@ abstract class HeaderDirectives extends FutureDirectives {
    *
    * @group header
    */
-  def checkSameOrigin(allowed: HttpOriginRange, inner: jf.Supplier[Route]): Route = RouteAdapter {
+  def checkSameOrigin(allowed: HttpOriginRange., inner: jf.Supplier[Route]): Route = RouteAdapter {
     D.checkSameOrigin(allowed.asScala) { inner.get().delegate }
   }
 

@@ -123,6 +123,7 @@ private object PoolConductor {
       setHandler(ctxIn, new InHandler {
         override def onPush(): Unit = {
           val ctx = grab(ctxIn)
+          println(slotStates.mkString("|"))
           val slot = nextSlot
           slotStates(slot) = slotStateAfterDispatch(slotStates(slot), ctx.request.method)
           nextSlot = bestSlot()
