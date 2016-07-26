@@ -364,7 +364,7 @@ abstract class GraphStageLogic private[stream] (val inCount: Int, val outCount: 
    * Requests an element on the given port unless the port is already closed.
    * Calling this method twice before an element arrived will fail.
    * There can only be one outstanding request at any given time. The method [[hasBeenPulled()]] can be used
-   * query whether pull is allowed to be called or not.
+   * to query whether pull is allowed to be called or not.
    */
   final protected def tryPull[T](in: Inlet[T]): Unit = if (!isClosed(in)) pull(in)
 

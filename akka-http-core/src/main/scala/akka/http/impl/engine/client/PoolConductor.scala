@@ -133,6 +133,7 @@ private object PoolConductor {
         override def onPush(): Unit = {
           val ctx = grab(ctxIn)
           val slot = nextSlot
+          println(s"$slot  CTXIN ${ctx.request.uri.path}")
           slotStates(slot) = slotStateAfterDispatch(slotStates(slot), ctx.request.method)
           nextSlot = bestSlot()
           emit(out, SwitchSlotCommand(DispatchCommand(ctx), slot), tryPullCtx)

@@ -1,0 +1,132 @@
+package akka.http.impl.engine.client
+
+import akka.http.impl.engine.client.PoolFlow.{ RequestContext, ResponseContext }
+import akka.http.impl.engine.client.PoolSlot.{ RawSlotEvent, SlotEvent }
+import akka.http.scaladsl.model.{ HttpRequest, HttpResponse }
+import akka.stream._
+import akka.stream.scaladsl.{ Flow, Source }
+import akka.stream.stage.{ GraphStage, GraphStageLogic, InHandler, OutHandler }
+
+import scala.collection.mutable.Queue
+import scala.util.Success
+
+object PoolSlotNew {
+  def apply(connectionFlow: Flow[HttpRequest, HttpResponse, Any])(implicit m: Materializer): Graph[FanOutShape2[RequestContext, ResponseContext, RawSlotEvent], Any] = {
+    null
+  }
+}
+
+private class PoolSlotNew(connectionFlow: Flow[HttpRequest, HttpResponse, Any], min: Int, max: Int)
+  extends GraphStage[FanOutShape2[RequestContext, ResponseContext, RawSlotEvent]] {
+
+  private val ctxIn = Inlet[RequestContext]("requestContext")
+  private val ctxOut = Outlet[ResponseContext]("responseContext")
+  private val slotEventOut = Outlet[RawSlotEvent]("retry")
+
+  override val shape = new FanOutShape2(ctxIn, ctxOut, slotEventOut)
+
+  override def createLogic(effectiveAttributes: Attributes) = new GraphStageLogic(shape) {
+
+    private var _next = -1
+    val retry: Queue[RequestContext] = new Queue[RequestContext]()
+    val failed: Queue[RequestContext] = new Queue[RequestContext]()
+
+    case class SubFlow(i: Int, first: RequestContext = null) extends InHandler with OutHandler {
+
+      var _first = first
+      val inFlight: Queue[RequestContext] = new Queue[RequestContext]()
+      private var offer: ResponseContext = null
+
+      def takeOffer(f: ResponseContext ⇒ Unit): Boolean =
+        if (offer != null) {
+          f(offer)
+          offer = null
+          sink.pull()
+          true
+        } else {
+          false
+        }
+
+      val source = new SubSourceOutlet[HttpRequest]("source")
+      val sink = new SubSinkInlet[HttpResponse]("sink")
+
+      override def onPull() = {
+        if (_first != null) {
+          // create lazy con here
+          source.push(_first.request)
+          inFlight.enqueue(_first)
+          _first = null
+        } else if (retry.nonEmpty) {
+          val ctx = retry.dequeue()
+          source.push(ctx.request)
+          inFlight.enqueue(ctx)
+        } else {
+          _next = i
+          pull(ctxIn)
+        }
+      }
+
+      override def onPush() = {
+        val response = sink.grab()
+        val reqCtx = inFlight.dequeue()
+        val resCtx = ResponseContext(reqCtx, Success(response))
+
+        /*if (!ctxOut.hasb) {push(ctxOut, resCtx)
+        else*/ offer = resCtx
+      }
+
+      override def onUpstreamFinish(): Unit = {
+        inFlight.dequeueAll(_ ⇒ true).foreach { rc ⇒
+          if (rc.retriesLeft > 0) retry.enqueue(rc)
+          else failed.enqueue(rc)
+        }
+        // pull from conns
+      }
+
+      source.setHandler(this)
+      sink.setHandler(this)
+
+      Source.fromGraph(source.source)
+        .via(connectionFlow)
+        .runWith(sink.sink)
+
+      if (first != null) sink.pull() // deferred demand
+    }
+
+    var subFlows: Option[SubFlow] = None // TODO subFlows
+
+    setHandler(ctxIn, new InHandler {
+      override def onPush() = {
+        // TODO route
+        val ctx = grab(ctxIn)
+        val subFlow =
+          if (_next == -1) { subFlows = Some(SubFlow(0, ctx)); subFlows.get }
+          else subFlows.get // subFlows(_next)
+
+        subFlow.inFlight.enqueue(ctx)
+        subFlow.source.push(ctx.request)
+      }
+    })
+
+    val takeFromOneSubAndPush = (s: SubFlow) ⇒ s.takeOffer(push(ctxOut, _))
+
+    var pulled = false
+    setHandler(ctxOut, new OutHandler {
+      override def onPull() =
+        // create eager con here
+        // eager demand
+        if (!subFlows.exists(takeFromOneSubAndPush)) pulled = true
+    })
+
+    setHandler(slotEventOut, new OutHandler {
+      override def onPull() = {
+        if (failed.nonEmpty) {
+          val rc = failed.dequeue()
+          push(slotEventOut, rc)
+        } else
+          subFlows.get.sink.pull() // TODO switch
+      }
+    })
+
+  }
+}

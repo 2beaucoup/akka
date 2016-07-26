@@ -89,7 +89,7 @@ class ConnectionPoolSpec extends AkkaSpec("""
       Seq(r1, r2).map(t ⇒ connNr(t._1.get)) should contain allOf (1, 2)
     }
 
-    "open a second connection if the request on the first one is dispatch but not yet completed" in new TestSetup {
+    "open a second connection if the request on the first one is dispatched but not yet completed" in new TestSetup {
       val (requestIn, responseOut, responseOutSub, hcp) = cachedHostConnectionPool[Int]()
 
       val responseEntityPub = TestPublisher.probe[ByteString]()
@@ -152,6 +152,48 @@ class ConnectionPoolSpec extends AkkaSpec("""
       acceptIncomingConnection()
 
       Await.result(idSum, 10.seconds) shouldEqual N * (N + 1) / 2
+    }
+
+    "be able to handle 500 pipelined requests with connection termination" ignore new TestSetup(autoAccept = true) {
+      def closeHeader() =
+        if (util.Random.nextInt(8) == 0) Connection("close") :: Nil else Nil
+
+      override def testServerHandler(connNr: Int): HttpRequest ⇒ HttpResponse = {
+        case r: HttpRequest ⇒
+          val idx = r.uri.path.tail.head.toString
+          HttpResponse()
+            .withHeaders(RawHeader("Req-Idx", idx) +: responseHeaders(r, connNr))
+            .withDefaultHeaders(closeHeader())
+      }
+
+      for (pipeliningLimit ← Iterator.from(1).map(math.pow(2, _).toInt).take(4)) {
+        val settings = ConnectionPoolSettings(system).withMaxConnections(4).withPipeliningLimit(pipeliningLimit)
+        val poolFlow = Http().cachedHostConnectionPool[Int](serverHostName, serverPort, settings = settings)
+
+        def method() =
+          if (false && util.Random.nextInt(2) == 0) HttpMethods.POST else HttpMethods.GET
+
+        def request(i: Int) =
+          HttpRequest(method = method(), headers = closeHeader(), uri = s"/$i") → i
+
+        val N = 500
+        val idSum =
+          Source.fromIterator(() ⇒ Iterator.from(1))
+            .take(N)
+            //.map { x ⇒ println(x); x }
+            .map(request)
+            .via(poolFlow)
+            .map {
+              case (Success(response), id) ⇒
+                val close = response.header[Connection].map(_.value.toString).getOrElse("")
+                println(s"pl$pipeliningLimit -- con${connNr(response)}: i$id $close")
+                requestUri(response) should endWith(s"/$id")
+                id
+              case x ⇒ fail(x.toString)
+            }.runFold(0)(_ + _)
+
+        Await.result(idSum, 30.seconds) shouldEqual N * (N + 1) / 2
+      }
     }
 
     "properly surface connection-level errors" in new TestSetup(autoAccept = true) {
